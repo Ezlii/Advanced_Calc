@@ -434,6 +434,8 @@ class CalculatorPage(QWidget):
             act.triggered.connect(lambda _=False, tok=token: self.mq_write(tok))
             self.const_menu.addAction(act)
 
+
+
         def make_btn(label: str) -> QPushButton:
             btn = QPushButton(label)
             btn.setFocusPolicy(Qt.NoFocus)
@@ -452,7 +454,7 @@ class CalculatorPage(QWidget):
                     btn.clicked.connect(self.on_equals)
                     btn.setDefault(True)
                 elif label == "a/b":
-                    btn.clicked.connect(lambda _=False: self.mq_write(r"\frac{}{}"))
+                    btn.clicked.connect(lambda _=False: self.mq_cmd_and_keys("frac", "Up"))
                 elif label == "÷":
                     btn.clicked.connect(lambda _=False: self.mq_write("/"))
                 elif label == "×":
@@ -460,14 +462,13 @@ class CalculatorPage(QWidget):
                 elif label == "−":
                     btn.clicked.connect(lambda _=False: self.mq_write("-"))
                 elif label == "√":
-                    btn.clicked.connect(lambda _=False: self.mq_write(r"\sqrt{}"))
+                    btn.clicked.connect(lambda _=False: self.mq_cmd_and_keys("sqrt"))
                 elif label == "x√y":
-                    # nth root template: \sqrt[]{} (index + radicand)
-                    btn.clicked.connect(lambda _=False: self.mq_write(r"\sqrt[]{}"))
+                    btn.clicked.connect(lambda _=False: self.mq_write_and_keys(r"\sqrt[]{}", "Left"))
                 elif label == "xʸ":
                     btn.clicked.connect(lambda _=False: self.mq_write(r"^{}"))
                 elif label == "10^x":
-                    btn.clicked.connect(lambda _=False: self.mq_write(r"10^{}"))
+                    btn.clicked.connect(lambda _=False: self.mq_write_and_keys("10^{}", "Left"))
                 elif label == "sin":
                     btn.clicked.connect(lambda _=False: self.mq_write(r"\sin\left(\right)"))
                 elif label == "cos":
@@ -507,8 +508,22 @@ class CalculatorPage(QWidget):
 
     # ----- MathQuill bridge helpers -----
     def mq_write(self, latex: str):
-        # ensure focused and insert
         self.web.page().runJavaScript(f"mq_writeLatex({latex!r})")
+
+    def mq_write_and_keys(self, latex: str, *keys: str):
+        # Alles in EINEM JS-Call, damit Reihenfolge garantiert ist
+        js = [f"mq_writeLatex({latex!r});"]
+        for k in keys:
+            js.append(f"mq_keystroke({k!r});")
+        js.append("mq_focus();")
+        self.web.page().runJavaScript("".join(js))
+
+    def mq_cmd_and_keys(self, cmd: str, *keys: str):
+        js = [f"mq_cmd({cmd!r});"]
+        for k in keys:
+            js.append(f"mq_keystroke({k!r});")
+        js.append("mq_focus();")
+        self.web.page().runJavaScript("".join(js))
 
     def mq_clear(self):
         self.web.page().runJavaScript("mq_clear()")
@@ -518,6 +533,7 @@ class CalculatorPage(QWidget):
 
     def mq_get_latex(self, callback):
         self.web.page().runJavaScript("mq_getLatex()", callback)
+
 
     # ----- UI actions -----
     def open_constants_menu(self):
@@ -571,6 +587,7 @@ class CalculatorPage(QWidget):
                 self.preview.setText(f"Fehler: {e}\n\nLaTeX: {latex}\nPython: {py_expr}")
 
         self.mq_get_latex(got)
+
 
 
 # ---------------- Main Window (tabs + drawer) ----------------
