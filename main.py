@@ -14,6 +14,10 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
+from pathlib import Path
+from PySide6.QtCore import QUrl
+
+
 
 # ---------------- MathQuill HTML ----------------
 HTML = r"""
@@ -23,10 +27,10 @@ HTML = r"""
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
 
-  <!-- Prototype via CDN (Internet required). Later we can vendor these files for offline. -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mathquill/build/mathquill.css">
-  <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mathquill/build/mathquill.min.js"></script>
+  <link rel="stylesheet" href="mathquill.css">
+  <script src="jquery.min.js"></script>
+  <script src="mathquill.min.js"></script>
+
 
   <style>
     body {
@@ -377,7 +381,8 @@ class CalculatorPage(QWidget):
 
         self.web = QWebEngineView()
         self.web.setObjectName("MathField")
-        self.web.setHtml(HTML)
+        base_dir = Path(__file__).resolve().parent / "assets" / "web"
+        self.web.setHtml(HTML, baseUrl=QUrl.fromLocalFile(str(base_dir) + "\\"))
         display_layout.addWidget(self.web)
 
         self.preview = QLabel("Output/Preview erscheint hier…")
