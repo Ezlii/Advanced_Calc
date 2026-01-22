@@ -1,19 +1,126 @@
 # main.py
 import sys
 import math
+import re
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, QEvent
 from PySide6.QtGui import QKeySequence, QPainter, QPen, QPixmap, QIcon, QColor, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QToolButton, QTabBar, QStackedWidget, QLineEdit, QLabel,
+    QToolButton, QTabBar, QStackedWidget, QLabel,
     QGridLayout, QPushButton, QFrame, QSizePolicy,
     QDialog, QDialogButtonBox, QColorDialog, QMenu
 )
+from PySide6.QtWebEngineWidgets import QWebEngineView
 
 
+# ---------------- MathQuill HTML ----------------
+HTML = r"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
 
+  <!-- Prototype via CDN (Internet required). Later we can vendor these files for offline. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mathquill/build/mathquill.css">
+  <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mathquill/build/mathquill.min.js"></script>
+
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+
+    /* "Input field" look */
+    .wrap {
+      border: 1px solid #2b313c;
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #0c0f14;
+      color: #ffffff;
+    }
+
+    #mathbox {
+      min-height: 30px;
+      font-size: 22px;
+      color: #ffffff;
+    }
+
+    .mq-editable-field {
+      border: none !important;
+      box-shadow: none !important;
+      background: transparent !important;
+    }
+
+    .mq-cursor {
+      border-left: 2px solid #ffffff !important;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <span id="mathbox"></span>
+  </div>
+
+  <script>
+    const MQ = MathQuill.getInterface(2);
+
+    window.mq = MQ.MathField(document.getElementById('mathbox'), {
+      spaceBehavesLikeTab: true
+    });
+
+    window.mq_getLatex = function() { return window.mq.latex(); };
+
+    window.mq_setLatex = function(s) {
+      window.mq.latex(s || "");
+      window.mq.focus();
+      return true;
+    };
+
+    window.mq_writeLatex = function(s) {
+      window.mq.write(s || "");
+      window.mq.focus();
+      return true;
+    };
+
+    window.mq_cmd = function(s) {
+      // cmd inserts control sequence (like "sqrt", "frac")
+      window.mq.cmd(s || "");
+      window.mq.focus();
+      return true;
+    };
+
+    window.mq_keystroke = function(k) {
+      window.mq.keystroke(k || "");
+      window.mq.focus();
+      return true;
+    };
+
+    window.mq_clear = function() {
+      window.mq.latex("");
+      window.mq.focus();
+      return true;
+    };
+
+    window.mq_focus = function() {
+      window.mq.focus();
+      return true;
+    };
+
+    window.mq.focus();
+  </script>
+</body>
+</html>
+"""
+
+
+# ---------------- Helpers: Theme + icons ----------------
 def make_gray_close_icon(size: int = 12) -> QIcon:
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
@@ -52,8 +159,7 @@ class SettingsDialog(QDialog):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
 
-        self.lbl_info = QLabel("Farben anpassen:")
-        root.addWidget(self.lbl_info)
+        root.addWidget(QLabel("Farben anpassen (wirkt sofort):"))
 
         row = QHBoxLayout()
         self.btn_bg = QPushButton("Fenster-Hintergrund…")
@@ -118,11 +224,140 @@ class DrawerMenu(QFrame):
         lay.addWidget(footer)
 
 
+# ---------------- LaTeX -> Python (MVP) ----------------
+def latex_to_python(expr: str) -> str:
+    """
+    MVP Converter: MathQuill LaTeX -> Python expression
+    Supports: frac, sqrt, nth-root (sqrt[]{}), pi/tau/phi, sin/cos/tan/ln/log, cdot, exponents.
+    """
+    if not expr:
+        return ""
+
+    s = expr.replace(" ", "")
+    s = s.replace(r"\left", "").replace(r"\right", "")
+    s = s.replace(r"\cdot", "*")
+
+    # constants
+    s = s.replace(r"\pi", "pi")
+    s = s.replace(r"\tau", "tau")
+    s = s.replace(r"\phi", "phi")
+
+    # functions (MathQuill often outputs \sin, \cos, \tan, \ln, \log)
+    s = s.replace(r"\sin", "sin")
+    s = s.replace(r"\cos", "cos")
+    s = s.replace(r"\tan", "tan")
+    s = s.replace(r"\ln", "ln")
+    s = s.replace(r"\log", "log10")
+
+    # Helper: {..} parsing
+    def extract_brace(text: str, brace_pos: int):
+        assert text[brace_pos] == "{"
+        depth = 0
+        i = brace_pos
+        while i < len(text):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[brace_pos + 1 : i], i
+            i += 1
+        return text[brace_pos + 1 :], len(text) - 1
+
+    # Convert \sqrt[IDX]{RAD}
+    while True:
+        m = re.search(r"\\sqrt\[(.*?)\]\{", s)
+        if not m:
+            break
+        idx_str = m.group(1)
+        start = m.start()
+        brace_pos = m.end() - 1  # points at '{'
+        rad, end_rad = extract_brace(s, brace_pos)
+        idx_py = latex_to_python(idx_str)
+        rad_py = latex_to_python(rad)
+        # nth root: root(n, x) = x**(1/n)
+        s = s[:start] + f"root(({idx_py}),({rad_py}))" + s[end_rad + 1 :]
+
+    # Convert \sqrt{...}
+    while True:
+        m = re.search(r"\\sqrt\{", s)
+        if not m:
+            break
+        start = m.start()
+        inner, end = extract_brace(s, m.end() - 1)
+        inner_py = latex_to_python(inner)
+        s = s[:start] + f"sqrt({inner_py})" + s[end + 1 :]
+
+    # Convert \frac{...}{...}
+    while True:
+        m = re.search(r"\\frac\{", s)
+        if not m:
+            break
+        start = m.start()
+        num, end_num = extract_brace(s, m.end() - 1)
+        if end_num + 1 >= len(s) or s[end_num + 1] != "{":
+            break
+        den, end_den = extract_brace(s, end_num + 1)
+        num_py = latex_to_python(num)
+        den_py = latex_to_python(den)
+        s = s[:start] + f"(({num_py})/({den_py}))" + s[end_den + 1 :]
+
+    # Exponents: ^{...} -> **(...)
+    while True:
+        m = re.search(r"\^\{", s)
+        if not m:
+            break
+        inner, end = extract_brace(s, m.start() + 1)  # '{' at m.start()+1
+        inner_py = latex_to_python(inner)
+        s = s[:m.start()] + f"**({inner_py})" + s[end + 1 :]
+
+    # Exponents: ^2 or ^x
+    s = re.sub(r"\^([0-9]+)", r"**(\1)", s)
+    s = re.sub(r"\^([a-zA-Z]+)", r"**(\1)", s)
+
+    # Factorial "!" -> fact(...)
+    # Simple pass: replace "n!" with fact(n) for plain numbers/identifiers/closing paren.
+    # This is simplistic; good enough for MVP.
+    s = re.sub(r"([0-9]+)!", r"fact(\1)", s)
+    s = re.sub(r"([a-zA-Z_][a-zA-Z0-9_]*)!", r"fact(\1)", s)
+    s = re.sub(r"(\))!", r"fact\1", s)  # rarely correct but keeps something
+
+    return s
+
+
+def safe_eval(expr: str, ans_value):
+    def root(n, x):
+        return x ** (1 / n)
+
+    env = {
+        "__builtins__": {},
+        "pi": math.pi,
+        "e": math.e,
+        "tau": math.tau,
+        "phi": (1 + 5 ** 0.5) / 2,
+        "c": 299_792_458,
+        "g": 9.80665,
+        "sqrt": math.sqrt,
+        "root": root,
+        "sin": math.sin,
+        "cos": math.cos,
+        "tan": math.tan,
+        "ln": math.log,
+        "log10": math.log10,
+        "abs": abs,
+        "round": round,
+        "fact": lambda n: math.factorial(int(n)),
+        "Ans": ans_value if ans_value is not None else 0,
+    }
+    return eval(expr, env, {})
+
+
+# ---------------- Calculator Page (MathQuill + Buttons) ----------------
 class CalculatorPage(QWidget):
     """
-    Eingabe + Output + Button-Grid.
-    ESC löscht Eingabe (wenn dieser Tab aktiv ist).
-    Buttons wachsen, bleiben quadratisch, berühren sich (0 spacing).
+    MathQuill 2D input in QWebEngineView + output label + 6x6 grid.
+    ESC clears input (MainWindow handles).
+    Buttons resize down in height until min_h.
     """
     def __init__(self, title="Calculator"):
         super().__init__()
@@ -133,23 +368,23 @@ class CalculatorPage(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        # Display
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Berechnung eingeben… (z.B. 2*(3+4))")
-        self.input.setClearButtonEnabled(True)
-        self.input.returnPressed.connect(self.on_equals)
-
-        self.preview = QLabel("Output/Preview erscheint hier…")
-        self.preview.setWordWrap(True)
-        self.preview.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
+        # Display frame
         display_frame = QFrame()
         display_frame.setObjectName("DisplayFrame")
         display_layout = QVBoxLayout(display_frame)
         display_layout.setContentsMargins(12, 12, 12, 12)
         display_layout.setSpacing(8)
-        display_layout.addWidget(self.input)
+
+        self.web = QWebEngineView()
+        self.web.setObjectName("MathField")
+        self.web.setHtml(HTML)
+        display_layout.addWidget(self.web)
+
+        self.preview = QLabel("Output/Preview erscheint hier…")
+        self.preview.setWordWrap(True)
+        self.preview.setTextInteractionFlags(Qt.TextSelectableByMouse)
         display_layout.addWidget(self.preview)
+
         root.addWidget(display_frame, 0)
 
         line = QFrame()
@@ -157,7 +392,7 @@ class CalculatorPage(QWidget):
         line.setFrameShadow(QFrame.Sunken)
         root.addWidget(line)
 
-        # Buttons
+        # Buttons grid area
         self.btn_area = QWidget()
         self.btn_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -168,8 +403,6 @@ class CalculatorPage(QWidget):
 
         self.buttons = []
 
-        # --------- Erweiterter Button-Plan (mehr Buttons, kleiner) ----------
-        # 6x6 = 36 Buttons
         layout_labels = [
             ["C",   "⌫", "(",   ")",   "a/b", "÷"],
             ["7",   "8", "9",   "×",   "xʸ",  "10^x"],
@@ -181,31 +414,19 @@ class CalculatorPage(QWidget):
         self.rows = len(layout_labels)
         self.cols = len(layout_labels[0])
 
-        def insert_text(t: str):
-            mapping = {
-                "÷": "/",
-                "×": "*",
-                "−": "-",
-                "xʸ": "**",
-                "π": "pi",
-                "e": "e",
-                "a/b": "/",
-            }
-            self.input.insert(mapping.get(t, t))
-
-        # Konstanten-Menü
+        # constants menu
         self.const_menu = QMenu(self)
         const_items = [
-            ("π (pi)", "pi"),
+            ("π (pi)", r"\pi"),
             ("e", "e"),
-            ("τ (tau)", "tau"),
-            ("φ (phi)", "phi"),
+            ("τ (tau)", r"\tau"),
+            ("φ (phi)", r"\phi"),
             ("c (Licht)", "c"),
             ("g (Erde)", "g"),
         ]
         for title, token in const_items:
             act = QAction(title, self)
-            act.triggered.connect(lambda _=False, tok=token: self.input.insert(tok))
+            act.triggered.connect(lambda _=False, tok=token: self.mq_write(tok))
             self.const_menu.addAction(act)
 
         def make_btn(label: str) -> QPushButton:
@@ -225,34 +446,49 @@ class CalculatorPage(QWidget):
                 elif label == "=":
                     btn.clicked.connect(self.on_equals)
                     btn.setDefault(True)
+                elif label == "a/b":
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\frac{}{}"))
+                elif label == "÷":
+                    btn.clicked.connect(lambda _=False: self.mq_write("/"))
+                elif label == "×":
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\cdot"))
+                elif label == "−":
+                    btn.clicked.connect(lambda _=False: self.mq_write("-"))
                 elif label == "√":
-                    btn.clicked.connect(lambda _=False: self.input.insert("sqrt("))
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\sqrt{}"))
                 elif label == "x√y":
-                    # x-te Wurzel: root(x, y) = y**(1/x)
-                    btn.clicked.connect(lambda _=False: self.input.insert("root("))
+                    # nth root template: \sqrt[]{} (index + radicand)
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\sqrt[]{}"))
+                elif label == "xʸ":
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"^{}"))
                 elif label == "10^x":
-                    btn.clicked.connect(lambda _=False: self.input.insert("10**("))
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"10^{}"))
                 elif label == "sin":
-                    btn.clicked.connect(lambda _=False: self.input.insert("sin("))
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\sin\left(\right)"))
                 elif label == "cos":
-                    btn.clicked.connect(lambda _=False: self.input.insert("cos("))
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\cos\left(\right)"))
                 elif label == "tan":
-                    btn.clicked.connect(lambda _=False: self.input.insert("tan("))
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\tan\left(\right)"))
                 elif label == "ln":
-                    btn.clicked.connect(lambda _=False: self.input.insert("ln("))
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\ln\left(\right)"))
                 elif label == "log":
-                    btn.clicked.connect(lambda _=False: self.input.insert("log10("))
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\log\left(\right)"))
                 elif label == "!":
-                    # factorial(n)
-                    btn.clicked.connect(lambda _=False: self.input.insert("fact("))
+                    btn.clicked.connect(lambda _=False: self.mq_write("!"))
                 elif label == "±":
-                    btn.clicked.connect(self.on_toggle_sign)
+                    # MVP: inserts "-" (real toggle is more complex)
+                    btn.clicked.connect(lambda _=False: self.mq_write("-"))
                 elif label == "Ans":
-                    btn.clicked.connect(lambda _=False: self.input.insert("Ans"))
+                    btn.clicked.connect(lambda _=False: self.mq_write("Ans"))
                 elif label == "Konst":
                     btn.clicked.connect(self.open_constants_menu)
+                elif label == "π":
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\pi"))
+                elif label == "e":
+                    btn.clicked.connect(lambda _=False: self.mq_write("e"))
                 else:
-                    btn.clicked.connect(lambda _=False, t=label: insert_text(t))
+                    # digits, '.', '+', parentheses
+                    btn.clicked.connect(lambda _=False, t=label: self.mq_write(t))
 
                 self.grid.addWidget(btn, r, c)
                 self.buttons.append(btn)
@@ -264,14 +500,28 @@ class CalculatorPage(QWidget):
 
         root.addWidget(self.btn_area, 1)
 
+    # ----- MathQuill bridge helpers -----
+    def mq_write(self, latex: str):
+        # ensure focused and insert
+        self.web.page().runJavaScript(f"mq_writeLatex({latex!r})")
+
+    def mq_clear(self):
+        self.web.page().runJavaScript("mq_clear()")
+
+    def mq_backspace(self):
+        self.web.page().runJavaScript("mq_keystroke('Backspace')")
+
+    def mq_get_latex(self, callback):
+        self.web.page().runJavaScript("mq_getLatex()", callback)
+
+    # ----- UI actions -----
     def open_constants_menu(self):
-        # Menü direkt am Button anzeigen
         btn = self.sender()
         if isinstance(btn, QPushButton):
             self.const_menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
     def clear_input(self):
-        self.input.clear()
+        self.mq_clear()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -284,91 +534,49 @@ class CalculatorPage(QWidget):
         cell_w = w // self.cols
         cell_h = h // self.rows
 
-        min_w = 36   # min Breite pro Button
-        min_h = 26   # min Höhe pro Button (DEIN Limit)
+        min_w = 36
+        min_h = 26
 
         for b in self.buttons:
             b.setMinimumSize(min_w, min_h)
 
-        # Optional: wenn genug Platz, Buttons größer machen
-        # (setMinimumSize alleine reicht meistens; das hier macht’s "snappier")
         target_w = max(min_w, cell_w)
         target_h = max(min_h, cell_h)
         for b in self.buttons:
             b.resize(target_w, target_h)
 
-    # ---- Logik ----
     def on_clear(self):
-        self.input.clear()
+        self.mq_clear()
         self.preview.setText("")
 
     def on_backspace(self):
-        t = self.input.text()
-        self.input.setText(t[:-1])
-
-    def on_toggle_sign(self):
-        t = self.input.text().strip()
-        if not t:
-            return
-        self.input.setText(t[1:] if t.startswith("-") else "-" + t)
+        self.mq_backspace()
 
     def on_equals(self):
-        expr = self.input.text().strip()
-        if not expr:
-            return
+        def got(latex):
+            latex = latex or ""
+            py_expr = latex_to_python(latex)
+            if not py_expr.strip():
+                return
+            try:
+                res = safe_eval(py_expr, self.ans_value)
+                self.ans_value = res
+                self.preview.setText(str(res))
+            except Exception as e:
+                self.preview.setText(f"Fehler: {e}\n\nLaTeX: {latex}\nPython: {py_expr}")
 
-        def root(x, y):
-            return y ** (1 / x)
-
-        safe_env = {
-            "__builtins__": {},
-
-            # Konstanten
-            "pi": math.pi,
-            "e": math.e,
-            "tau": math.tau,
-            "phi": (1 + 5 ** 0.5) / 2,
-            "c": 299_792_458,      # m/s
-            "g": 9.80665,         # m/s^2
-
-            # Grundfunktionen
-            "sqrt": math.sqrt,
-            "root": root,
-            "abs": abs,
-            "round": round,
-
-            # Trig / Log
-            "sin": math.sin,
-            "cos": math.cos,
-            "tan": math.tan,
-            "ln": math.log,
-            "log10": math.log10,
-
-            # Weitere
-            "fact": lambda n: math.factorial(int(n)),
-
-            # Speicher
-            "Ans": self.ans_value if self.ans_value is not None else 0,
-        }
-
-        try:
-            result = eval(expr, safe_env, {})
-            self.ans_value = result
-            self.preview.setText(str(result))
-        except Exception as e:
-            self.preview.setText(f"Fehler: {e}")
+        self.mq_get_latex(got)
 
 
+# ---------------- Main Window (tabs + drawer) ----------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-
         self.theme = Theme()
         self.close_icon = make_gray_close_icon(12)
 
         self.setWindowTitle(" ")
         self.resize(980, 720)
-
         self.setMinimumHeight(420)
 
         central = QWidget()
@@ -418,14 +626,13 @@ class MainWindow(QMainWindow):
         sep.setFrameShape(QFrame.HLine)
         sep.setFrameShadow(QFrame.Plain)
 
-        # --- Body: Drawer links + Content rechts ---
+        # --- Body ---
         body = QWidget()
         body_layout = QHBoxLayout(body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(0)
 
         self.drawer = DrawerMenu(self.switch_mode, parent=body)
-
         self.drawer.setMaximumWidth(0)
         self.drawer.setVisible(False)
         self.drawer_open = False
@@ -446,6 +653,7 @@ class MainWindow(QMainWindow):
         self.add_tab()
         self.apply_theme()
 
+    # ---------- Theme ----------
     def apply_theme(self):
         t = self.theme
         self.setStyleSheet(f"""
@@ -522,21 +730,13 @@ class MainWindow(QMainWindow):
                 border-radius: 12px;
             }}
 
-            QLineEdit {{
-                font-size: 18px;
-                padding: 10px;
-                background: #0c0f14;
-                border: 1px solid #2b313c;
-                border-radius: 10px;
-                color: {t.text_strong};
-            }}
             QLabel {{
                 font-size: 14px;
                 background: transparent;
             }}
 
             QPushButton {{
-                font-size: 14px;        /* kleiner damit mehr Buttons gut passen */
+                font-size: 14px;
                 border-radius: 0px;
                 border: 1px solid #1a1f27;
                 background: #141922;
@@ -549,8 +749,7 @@ class MainWindow(QMainWindow):
             }}
         """)
 
-
-
+    # ---------- Drawer ----------
     def toggle_drawer(self):
         self.drawer_anim.stop()
 
@@ -572,6 +771,7 @@ class MainWindow(QMainWindow):
             self.drawer_open = True
             self.drawer_anim.start()
 
+    # ---------- Tabs ----------
     def add_tab(self):
         page = CalculatorPage(title="Calculator")
         idx = self.stack.addWidget(page)
@@ -630,6 +830,7 @@ class MainWindow(QMainWindow):
         if 0 <= index < self.stack.count():
             self.stack.setCurrentIndex(index)
 
+    # ---------- Menu / Mode ----------
     def switch_mode(self, mode_name: str):
         w = self.stack.currentWidget()
         if isinstance(w, CalculatorPage):
@@ -637,10 +838,12 @@ class MainWindow(QMainWindow):
         if self.drawer_open:
             self.toggle_drawer()
 
+    # ---------- Settings ----------
     def open_settings(self):
         dlg = SettingsDialog(self.theme, parent=self)
         dlg.exec()
 
+    # ---------- ESC: clear current input ----------
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             w = self.stack.currentWidget()
@@ -656,12 +859,12 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
 
-    app.setWindowIcon(QIcon("assets/app_icon2.png"))  # ← WICHTIG
+    # your app icon (optional)
+    app.setWindowIcon(QIcon("assets/app_icon2.png"))
 
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
-
 
 
 if __name__ == "__main__":
