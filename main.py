@@ -2,10 +2,14 @@
 import sys
 import math
 import re
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, QEvent
-from PySide6.QtGui import QKeySequence, QPainter, QPen, QPixmap, QIcon, QColor, QAction
+from PySide6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, QObject, Slot, QEvent
+from PySide6.QtGui import (
+    QKeySequence, QPainter, QPen, QPixmap, QIcon, QColor, QAction, QShortcut
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolButton, QTabBar, QStackedWidget, QLabel,
@@ -13,14 +17,12 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QColorDialog, QMenu
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
-
-from pathlib import Path
+from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtCore import QUrl
 
 
-
-# ---------------- MathQuill HTML ----------------
-HTML = r"""
+# ---------------- MathQuill INPUT HTML ----------------
+HTML_INPUT = r"""
 <!doctype html>
 <html>
 <head>
@@ -31,16 +33,8 @@ HTML = r"""
   <script src="jquery.min.js"></script>
   <script src="mathquill.min.js"></script>
 
-
   <style>
-    body {
-      margin: 0;
-      padding: 0;
-      background: transparent;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    }
-
-    /* "Input field" look */
+    body { margin:0; padding:0; background:transparent; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; }
     .wrap {
       border: 1px solid #2b313c;
       border-radius: 10px;
@@ -48,25 +42,11 @@ HTML = r"""
       background: #0c0f14;
       color: #ffffff;
     }
-
-    #mathbox {
-      min-height: 30px;
-      font-size: 22px;
-      color: #ffffff;
-    }
-
-    .mq-editable-field {
-      border: none !important;
-      box-shadow: none !important;
-      background: transparent !important;
-    }
-
-    .mq-cursor {
-      border-left: 2px solid #ffffff !important;
-    }
+    #mathbox { min-height: 30px; font-size: 22px; color:#ffffff; }
+    .mq-editable-field { border:none !important; box-shadow:none !important; background:transparent !important; }
+    .mq-cursor { border-left: 2px solid #ffffff !important; }
   </style>
 </head>
-
 <body>
   <div class="wrap">
     <span id="mathbox"></span>
@@ -94,7 +74,6 @@ HTML = r"""
     };
 
     window.mq_cmd = function(s) {
-      // cmd inserts control sequence (like "sqrt", "frac")
       window.mq.cmd(s || "");
       window.mq.focus();
       return true;
@@ -118,6 +97,117 @@ HTML = r"""
     };
 
     window.mq.focus();
+  </script>
+</body>
+</html>
+"""
+
+
+# ---------------- HISTORY HTML (MathJax + clickable) ----------------
+HTML_HISTORY = r"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { margin:0; padding:0; background:transparent; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; }
+    .wrap {
+      background: #0f1217;
+      border: 1px solid #2b313c;
+      border-radius: 12px;
+      padding: 10px;
+      height: 100vh;
+      box-sizing: border-box;
+      overflow: auto;
+    }
+
+    .entry {
+      border: 1px solid #2b313c;
+      border-radius: 10px;
+      background: #0c0f14;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .entry:hover { background: #121826; }
+
+    .expr { color:#ffffff; font-weight:600; font-size: 16px; }
+    .res  { margin-top: 6px; color:#d7dde7; font-size: 16px; }
+    .hint { color:#9aa4b2; font-size: 14px; padding: 8px 4px; }
+
+    /* MathJax */
+    mjx-container { color: #ffffff !important; }
+  </style>
+
+  <!-- QWebChannel (Qt) -->
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
+  <!-- MathJax (CDN) -->
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['\\(','\\)'], ['$', '$']] },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+</head>
+<body>
+  <div class="wrap" id="wrap">
+    <div class="hint" id="hint">History erscheint hier… (drücke =)</div>
+    <div id="list"></div>
+  </div>
+
+  <script>
+    let bridge = null;
+
+    new QWebChannel(qt.webChannelTransport, function(channel) {
+      bridge = channel.objects.bridge;
+    });
+
+    function escapeHtml(s) {
+      return (s || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+                      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+    }
+
+    function addEntry(latex, resultText) {
+      const hint = document.getElementById("hint");
+      if (hint) hint.style.display = "none";
+
+      const list = document.getElementById("list");
+
+      // IMPORTANT: latex should be inserted into MathJax delimiters
+      const latexEsc = escapeHtml(latex || "");
+      const resEsc = escapeHtml(resultText || "");
+
+      const div = document.createElement("div");
+      div.className = "entry";
+      div.setAttribute("data-latex", latex || "");
+
+      div.innerHTML = `
+        <div class="expr">\\(${latexEsc}\\)</div>
+        <div class="res">= ${resEsc}</div>
+      `;
+
+      div.addEventListener("click", () => {
+        const ltx = div.getAttribute("data-latex") || "";
+        if (bridge && bridge.setFromHistory) {
+          bridge.setFromHistory(ltx);
+        }
+      });
+
+      // prepend: newest on top
+      if (list.firstChild) list.insertBefore(div, list.firstChild);
+      else list.appendChild(div);
+
+      // typeset this entry only
+      if (window.MathJax && MathJax.typesetPromise) {
+        MathJax.typesetPromise([div]).catch(()=>{});
+      }
+    }
+
+    window.history_addEntry = addEntry;
   </script>
 </body>
 </html>
@@ -160,10 +250,10 @@ class SettingsDialog(QDialog):
         self.theme = theme
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 14, 14, 14)
+        root.setContentsMargins(15, 15,  15, 15)
         root.setSpacing(10)
 
-        root.addWidget(QLabel("Farben anpassen (wirkt sofort):"))
+        root.addWidget(QLabel("Farben anpassen:"))
 
         row = QHBoxLayout()
         self.btn_bg = QPushButton("Fenster-Hintergrund…")
@@ -230,30 +320,23 @@ class DrawerMenu(QFrame):
 
 # ---------------- LaTeX -> Python (MVP) ----------------
 def latex_to_python(expr: str) -> str:
-    """
-    MVP Converter: MathQuill LaTeX -> Python expression
-    Supports: frac, sqrt, nth-root (sqrt[]{}), pi/tau/phi, sin/cos/tan/ln/log, cdot, exponents.
-    """
     if not expr:
         return ""
 
     s = expr.replace(" ", "")
     s = s.replace(r"\left", "").replace(r"\right", "")
     s = s.replace(r"\cdot", "*")
+    s = s.replace(r"\bmod", "%")
 
-    # constants
     s = s.replace(r"\pi", "pi")
     s = s.replace(r"\tau", "tau")
     s = s.replace(r"\phi", "phi")
 
-    # functions (MathQuill often outputs \sin, \cos, \tan, \ln, \log)
     s = s.replace(r"\sin", "sin")
     s = s.replace(r"\cos", "cos")
     s = s.replace(r"\tan", "tan")
     s = s.replace(r"\ln", "ln")
-    s = s.replace(r"\log", "log10")
 
-    # Helper: {..} parsing
     def extract_brace(text: str, brace_pos: int):
         assert text[brace_pos] == "{"
         depth = 0
@@ -264,25 +347,50 @@ def latex_to_python(expr: str) -> str:
             elif text[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    return text[brace_pos + 1 : i], i
+                    return text[brace_pos + 1: i], i
             i += 1
-        return text[brace_pos + 1 :], len(text) - 1
+        return text[brace_pos + 1:], len(text) - 1
 
-    # Convert \sqrt[IDX]{RAD}
+    def extract_paren(text: str, paren_pos: int):
+        assert text[paren_pos] == "("
+        depth = 0
+        i = paren_pos
+        while i < len(text):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[paren_pos + 1: i], i
+            i += 1
+        return text[paren_pos + 1:], len(text) - 1
+
+    # ABS: |...|
+    while True:
+        a = s.find("|")
+        if a == -1:
+            break
+        b = s.find("|", a + 1)
+        if b == -1:
+            break
+        inner = s[a + 1:b]
+        inner_py = latex_to_python(inner)
+        s = s[:a] + f"abs({inner_py})" + s[b + 1:]
+
+    # \sqrt[IDX]{RAD}
     while True:
         m = re.search(r"\\sqrt\[(.*?)\]\{", s)
         if not m:
             break
         idx_str = m.group(1)
         start = m.start()
-        brace_pos = m.end() - 1  # points at '{'
+        brace_pos = m.end() - 1
         rad, end_rad = extract_brace(s, brace_pos)
         idx_py = latex_to_python(idx_str)
         rad_py = latex_to_python(rad)
-        # nth root: root(n, x) = x**(1/n)
-        s = s[:start] + f"root(({idx_py}),({rad_py}))" + s[end_rad + 1 :]
+        s = s[:start] + f"root(({idx_py}),({rad_py}))" + s[end_rad + 1:]
 
-    # Convert \sqrt{...}
+    # \sqrt{...}
     while True:
         m = re.search(r"\\sqrt\{", s)
         if not m:
@@ -290,9 +398,9 @@ def latex_to_python(expr: str) -> str:
         start = m.start()
         inner, end = extract_brace(s, m.end() - 1)
         inner_py = latex_to_python(inner)
-        s = s[:start] + f"sqrt({inner_py})" + s[end + 1 :]
+        s = s[:start] + f"sqrt({inner_py})" + s[end + 1:]
 
-    # Convert \frac{...}{...}
+    # \frac{...}{...}
     while True:
         m = re.search(r"\\frac\{", s)
         if not m:
@@ -304,27 +412,41 @@ def latex_to_python(expr: str) -> str:
         den, end_den = extract_brace(s, end_num + 1)
         num_py = latex_to_python(num)
         den_py = latex_to_python(den)
-        s = s[:start] + f"(({num_py})/({den_py}))" + s[end_den + 1 :]
+        s = s[:start] + f"(({num_py})/({den_py}))" + s[end_den + 1:]
 
-    # Exponents: ^{...} -> **(...)
+    # log base: \log_{b}(x) -> log(x, b)
+    while True:
+        m = re.search(r"\\log_\{", s)
+        if not m:
+            break
+        start = m.start()
+        base, end_base = extract_brace(s, m.end() - 1)
+        if end_base + 1 >= len(s) or s[end_base + 1] != "(":
+            break
+        arg, end_arg = extract_paren(s, end_base + 1)
+        base_py = latex_to_python(base)
+        arg_py = latex_to_python(arg)
+        s = s[:start] + f"log(({arg_py}),({base_py}))" + s[end_arg + 1:]
+
+    # plain \log(...) -> log10(...)
+    s = s.replace(r"\log", "log10")
+
+    # exponents
     while True:
         m = re.search(r"\^\{", s)
         if not m:
             break
-        inner, end = extract_brace(s, m.start() + 1)  # '{' at m.start()+1
+        inner, end = extract_brace(s, m.start() + 1)
         inner_py = latex_to_python(inner)
-        s = s[:m.start()] + f"**({inner_py})" + s[end + 1 :]
+        s = s[:m.start()] + f"**({inner_py})" + s[end + 1:]
 
-    # Exponents: ^2 or ^x
     s = re.sub(r"\^([0-9]+)", r"**(\1)", s)
     s = re.sub(r"\^([a-zA-Z]+)", r"**(\1)", s)
 
-    # Factorial "!" -> fact(...)
-    # Simple pass: replace "n!" with fact(n) for plain numbers/identifiers/closing paren.
-    # This is simplistic; good enough for MVP.
+    # factorial
     s = re.sub(r"([0-9]+)!", r"fact(\1)", s)
     s = re.sub(r"([a-zA-Z_][a-zA-Z0-9_]*)!", r"fact(\1)", s)
-    s = re.sub(r"(\))!", r"fact\1", s)  # rarely correct but keeps something
+    s = re.sub(r"(\))!", r"fact\1", s)
 
     return s
 
@@ -348,6 +470,7 @@ def safe_eval(expr: str, ans_value):
         "tan": math.tan,
         "ln": math.log,
         "log10": math.log10,
+        "log": math.log,  # log(x, base)
         "abs": abs,
         "round": round,
         "fact": lambda n: math.factorial(int(n)),
@@ -356,42 +479,82 @@ def safe_eval(expr: str, ans_value):
     return eval(expr, env, {})
 
 
-# ---------------- Calculator Page (MathQuill + Buttons) ----------------
+# ---------------- Calculator Page (Input + History + Buttons) ----------------
 class CalculatorPage(QWidget):
-    """
-    MathQuill 2D input in QWebEngineView + output label + 6x6 grid.
-    ESC clears input (MainWindow handles).
-    Buttons resize down in height until min_h.
-    """
+    class HistoryBridge(QObject):
+        def __init__(self, parent_page: "CalculatorPage"):
+            super().__init__()
+            self.page = parent_page
+
+        @Slot(str)
+        def setFromHistory(self, latex: str):
+            self.page.mq_set(latex)
+            self.page.focus_mathfield()
+
     def __init__(self, title="Calculator"):
         super().__init__()
         self.title = title
         self.ans_value = None
 
+        # 2nd toggle state
+        self.second_mode = False
+        self.btn_trig = {}
+        self.btn_second = None
+
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        # Display frame
+        # Display frame (Input + History)
         display_frame = QFrame()
         display_frame.setObjectName("DisplayFrame")
         display_layout = QVBoxLayout(display_frame)
         display_layout.setContentsMargins(12, 12, 12, 12)
-        display_layout.setSpacing(8)
+        display_layout.setSpacing(3)
 
+        # --- Input bar (MathQuill) ---
         self.web = QWebEngineView()
         self.web.setObjectName("MathField")
+        self.web.setFocusPolicy(Qt.StrongFocus)
+        self.web.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.web.setMinimumHeight(70)
+        self.web.setMaximumHeight(90)
+
         base_dir = Path(__file__).resolve().parent / "assets" / "web"
-        self.web.setHtml(HTML, baseUrl=QUrl.fromLocalFile(str(base_dir) + "\\"))
+        self.web.setHtml(HTML_INPUT, baseUrl=QUrl.fromLocalFile(str(base_dir) + "/"))
+        self.web.loadFinished.connect(lambda _ok: self.focus_mathfield())
         display_layout.addWidget(self.web)
 
-        self.preview = QLabel("Output/Preview erscheint hier…")
-        self.preview.setWordWrap(True)
-        self.preview.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        display_layout.addWidget(self.preview)
+        # --- History (WebView for MathJax + click) ---
+        self.history_web = QWebEngineView()
+        self.history_web.setObjectName("HistoryWeb")
+        self.history_web.setFocusPolicy(Qt.NoFocus)  # clicks go through JS anyway
+        self.history_web.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        root.addWidget(display_frame, 0)
+        self.bridge = CalculatorPage.HistoryBridge(self)
+        self.channel = QWebChannel(self.history_web.page())
+        self.channel.registerObject("bridge", self.bridge)
+        self.history_web.page().setWebChannel(self.channel)
 
+        
+
+
+        # load history html
+        self.history_web.setHtml(HTML_HISTORY, baseUrl=QUrl("about:blank"))
+        display_layout.addWidget(self.history_web, 1)
+
+
+        # --- Input WebView: echten Hintergrund transparent machen ---
+        self.web.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.web.page().setBackgroundColor(Qt.transparent)
+
+        # --- History WebView: Hintergrund auf dunkel setzen (damit nix weiß aufblitzt) ---
+        self.history_web.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.history_web.page().setBackgroundColor(QColor("#0f1217"))
+
+        root.addWidget(display_frame, 1)
+
+        # separator
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setFrameShadow(QFrame.Sunken)
@@ -409,13 +572,14 @@ class CalculatorPage(QWidget):
         self.buttons = []
 
         layout_labels = [
-            ["C",   "⌫", "(",   ")",   "a/b", "÷"],
-            ["7",   "8", "9",   "×",   "xʸ",  "10^x"],
-            ["4",   "5", "6",   "−",   "√",   "x√y"],
-            ["1",   "2", "3",   "+",   "sin", "cos"],
-            ["0",   ".", "±",   "=",   "tan", "Ans"],
-            ["Konst","π", "e",  "ln",  "log", "!"],
-        ]
+        ["2nd", "C",  "⌫",  "(",   ")",   "a/b"],   # <- a/b statt ÷
+        ["7",   "8",  "9",  "×",   "xʸ",  "x²"],
+        ["4",   "5",  "6",  "−",   "√",   "x√y"],
+        ["1",   "2",  "3",  "+",   "sin", "cos"],
+        ["0",   ".",  "±",  "=",   "tan", "Ans"],
+        ["1/x", "|x|","mod","ln",  "log", "logᵧ(x)"],
+        ["Konst","π", "e",  "10^x","!",   "÷"],     # <- ÷ ins leere Feld
+]
         self.rows = len(layout_labels)
         self.cols = len(layout_labels[0])
 
@@ -434,8 +598,6 @@ class CalculatorPage(QWidget):
             act.triggered.connect(lambda _=False, tok=token: self.mq_write(tok))
             self.const_menu.addAction(act)
 
-
-
         def make_btn(label: str) -> QPushButton:
             btn = QPushButton(label)
             btn.setFocusPolicy(Qt.NoFocus)
@@ -446,15 +608,21 @@ class CalculatorPage(QWidget):
             for c, label in enumerate(row):
                 btn = make_btn(label)
 
-                if label == "C":
+                if label == "":
+                    btn.setEnabled(False)
+
+                elif label == "2nd":
+                    self.btn_second = btn
+                    btn.clicked.connect(self.toggle_second)
+
+                elif label == "C":
                     btn.clicked.connect(self.on_clear)
                 elif label == "⌫":
                     btn.clicked.connect(self.on_backspace)
                 elif label == "=":
                     btn.clicked.connect(self.on_equals)
                     btn.setDefault(True)
-                elif label == "a/b":
-                    btn.clicked.connect(lambda _=False: self.mq_cmd_and_keys("frac", "Up"))
+
                 elif label == "÷":
                     btn.clicked.connect(lambda _=False: self.mq_write("/"))
                 elif label == "×":
@@ -469,20 +637,28 @@ class CalculatorPage(QWidget):
                     btn.clicked.connect(lambda _=False: self.mq_write(r"^{}"))
                 elif label == "10^x":
                     btn.clicked.connect(lambda _=False: self.mq_write_and_keys("10^{}", "Left"))
+                elif label == "x²":
+                    btn.clicked.connect(lambda _=False: self.mq_write("^2"))
+                elif label == "a/b":
+                    btn.clicked.connect(lambda _=False: self.mq_cmd_and_keys("frac", "Up"))
                 elif label == "sin":
-                    btn.clicked.connect(lambda _=False: self.mq_write(r"\sin\left(\right)"))
+                    self.btn_trig["sin"] = btn
+                    btn.clicked.connect(lambda _=False: self.on_trig("sin"))
                 elif label == "cos":
-                    btn.clicked.connect(lambda _=False: self.mq_write(r"\cos\left(\right)"))
+                    self.btn_trig["cos"] = btn
+                    btn.clicked.connect(lambda _=False: self.on_trig("cos"))
                 elif label == "tan":
-                    btn.clicked.connect(lambda _=False: self.mq_write(r"\tan\left(\right)"))
+                    self.btn_trig["tan"] = btn
+                    btn.clicked.connect(lambda _=False: self.on_trig("tan"))
                 elif label == "ln":
                     btn.clicked.connect(lambda _=False: self.mq_write(r"\ln\left(\right)"))
                 elif label == "log":
                     btn.clicked.connect(lambda _=False: self.mq_write(r"\log\left(\right)"))
+                elif label == "logᵧ(x)":
+                    btn.clicked.connect(lambda _=False: self.mq_write_and_keys(r"\log_{}\left(\right)", "Left"))
                 elif label == "!":
                     btn.clicked.connect(lambda _=False: self.mq_write("!"))
                 elif label == "±":
-                    # MVP: inserts "-" (real toggle is more complex)
                     btn.clicked.connect(lambda _=False: self.mq_write("-"))
                 elif label == "Ans":
                     btn.clicked.connect(lambda _=False: self.mq_write("Ans"))
@@ -492,26 +668,41 @@ class CalculatorPage(QWidget):
                     btn.clicked.connect(lambda _=False: self.mq_write(r"\pi"))
                 elif label == "e":
                     btn.clicked.connect(lambda _=False: self.mq_write("e"))
+                elif label == "|x|":
+                    btn.clicked.connect(lambda _=False: self.mq_write_and_keys(r"\left|\right|", "Left"))
+                elif label == "mod":
+                    btn.clicked.connect(lambda _=False: self.mq_write(r"\bmod"))
+                elif label == "1/x":
+                    btn.clicked.connect(self.insert_reciprocal)
+
                 else:
-                    # digits, '.', '+', parentheses
                     btn.clicked.connect(lambda _=False, t=label: self.mq_write(t))
 
                 self.grid.addWidget(btn, r, c)
                 self.buttons.append(btn)
 
-        for r in range(self.rows):
-            self.grid.setRowStretch(r, 1)
-        for c in range(self.cols):
-            self.grid.setColumnStretch(c, 1)
+        for rr in range(self.rows):
+            self.grid.setRowStretch(rr, 1)
+        for cc in range(self.cols):
+            self.grid.setColumnStretch(cc, 1)
 
         root.addWidget(self.btn_area, 1)
+
+        self.refresh_second_ui()
+
+    # ----- Fokus helper -----
+    def focus_mathfield(self):
+        self.web.setFocus(Qt.OtherFocusReason)
+        self.web.page().runJavaScript("mq_focus();")
 
     # ----- MathQuill bridge helpers -----
     def mq_write(self, latex: str):
         self.web.page().runJavaScript(f"mq_writeLatex({latex!r})")
 
+    def mq_set(self, latex: str):
+        self.web.page().runJavaScript(f"mq_setLatex({latex!r})")
+
     def mq_write_and_keys(self, latex: str, *keys: str):
-        # Alles in EINEM JS-Call, damit Reihenfolge garantiert ist
         js = [f"mq_writeLatex({latex!r});"]
         for k in keys:
             js.append(f"mq_keystroke({k!r});")
@@ -534,6 +725,56 @@ class CalculatorPage(QWidget):
     def mq_get_latex(self, callback):
         self.web.page().runJavaScript("mq_getLatex()", callback)
 
+    # ----- History -----
+    def append_history(self, latex: str, result_text: str):
+        # Call JS function to prepend entry and render via MathJax
+        # Use JSON to escape safely.
+        ltx = latex or ""
+        res = result_text or ""
+        js = f"window.history_addEntry({json.dumps(ltx)}, {json.dumps(res)});"
+        self.history_web.page().runJavaScript(js)
+
+    # ----- 2nd logic -----
+    def toggle_second(self):
+        self.second_mode = not self.second_mode
+        self.refresh_second_ui()
+        self.focus_mathfield()
+
+    def refresh_second_ui(self):
+        if "sin" in self.btn_trig:
+            self.btn_trig["sin"].setText("sin⁻¹" if self.second_mode else "sin")
+        if "cos" in self.btn_trig:
+            self.btn_trig["cos"].setText("cos⁻¹" if self.second_mode else "cos")
+        if "tan" in self.btn_trig:
+            self.btn_trig["tan"].setText("tan⁻¹" if self.second_mode else "tan")
+        if self.btn_second:
+            self.btn_second.setText("2nd✓" if self.second_mode else "2nd")
+
+    def on_trig(self, kind: str):
+        if self.second_mode:
+            if kind == "sin":
+                self.mq_write(r"\sin^{-1}\left(\right)")
+            elif kind == "cos":
+                self.mq_write(r"\cos^{-1}\left(\right)")
+            elif kind == "tan":
+                self.mq_write(r"\tan^{-1}\left(\right)")
+        else:
+            if kind == "sin":
+                self.mq_write(r"\sin\left(\right)")
+            elif kind == "cos":
+                self.mq_write(r"\cos\left(\right)")
+            elif kind == "tan":
+                self.mq_write(r"\tan\left(\right)")
+        self.focus_mathfield()
+
+    def insert_reciprocal(self):
+        js = [
+            "mq_cmd('frac');",
+            "mq_writeLatex('1');",
+            "mq_keystroke('Down');",
+            "mq_focus();"
+        ]
+        self.web.page().runJavaScript("".join(js))
 
     # ----- UI actions -----
     def open_constants_menu(self):
@@ -543,6 +784,7 @@ class CalculatorPage(QWidget):
 
     def clear_input(self):
         self.mq_clear()
+        self.focus_mathfield()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -568,10 +810,11 @@ class CalculatorPage(QWidget):
 
     def on_clear(self):
         self.mq_clear()
-        self.preview.setText("")
+        self.focus_mathfield()
 
     def on_backspace(self):
         self.mq_backspace()
+        self.focus_mathfield()
 
     def on_equals(self):
         def got(latex):
@@ -582,12 +825,13 @@ class CalculatorPage(QWidget):
             try:
                 res = safe_eval(py_expr, self.ans_value)
                 self.ans_value = res
-                self.preview.setText(str(res))
+                self.append_history(latex, str(res))
             except Exception as e:
-                self.preview.setText(f"Fehler: {e}\n\nLaTeX: {latex}\nPython: {py_expr}")
+                self.append_history(latex, f"Fehler: {e}")
+            finally:
+                self.focus_mathfield()
 
         self.mq_get_latex(got)
-
 
 
 # ---------------- Main Window (tabs + drawer) ----------------
@@ -672,8 +916,58 @@ class MainWindow(QMainWindow):
         outer.addWidget(sep)
         outer.addWidget(body, 1)
 
+        self._enter_filter = MainWindow._GlobalEnterFilter(self)
+        QApplication.instance().installEventFilter(self._enter_filter)
+
+
+        # ESC global
+        self.sc_esc = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        self.sc_esc.setContext(Qt.ApplicationShortcut)
+        self.sc_esc.activated.connect(self._esc_clear_current)
+
+
         self.add_tab()
         self.apply_theme()
+
+    class _GlobalEnterFilter(QObject):
+        def __init__(self, win: "MainWindow"):
+            super().__init__(win)
+            self.win = win
+
+        def eventFilter(self, obj, event):
+            # 1) ShortcutOverride: nur abfangen, damit Qt nix anderes damit macht
+            if event.type() == QEvent.ShortcutOverride:
+                if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    if event.modifiers() & Qt.ShiftModifier:
+                        return False
+                    return True  # nur blocken, NICHT auslösen
+
+            # 2) KeyPress: hier genau 1x auslösen
+            if event.type() == QEvent.KeyPress:
+                if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    if event.modifiers() & Qt.ShiftModifier:
+                        return False
+                    if event.isAutoRepeat():           # wichtig gegen key-repeat
+                        return True
+                    if not self.win.isActiveWindow():
+                        return False
+                    self.win._enter_equals()
+                    return True
+
+            return False
+
+
+
+    def _esc_clear_current(self):
+        w = self.stack.currentWidget()
+        if isinstance(w, CalculatorPage):
+            w.clear_input()
+
+    def _enter_equals(self):
+        w = self.stack.currentWidget()
+        if isinstance(w, CalculatorPage):
+            w.on_equals()
+
 
     # ---------- Theme ----------
     def apply_theme(self):
@@ -803,6 +1097,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(idx)
 
         self._apply_close_button(tab_index)
+        page.focus_mathfield()
 
     def _apply_close_button(self, tab_index: int):
         btn = QToolButton()
@@ -848,15 +1143,23 @@ class MainWindow(QMainWindow):
         self.tabbar.setCurrentIndex(cur)
         self.stack.setCurrentIndex(cur)
 
+        w = self.stack.currentWidget()
+        if isinstance(w, CalculatorPage):
+            w.focus_mathfield()
+
     def on_tab_changed(self, index: int):
         if 0 <= index < self.stack.count():
             self.stack.setCurrentIndex(index)
+            w = self.stack.currentWidget()
+            if isinstance(w, CalculatorPage):
+                w.focus_mathfield()
 
     # ---------- Menu / Mode ----------
     def switch_mode(self, mode_name: str):
         w = self.stack.currentWidget()
         if isinstance(w, CalculatorPage):
-            w.preview.setText(f"Modus gewechselt: {mode_name} (Platzhalter)")
+            w.append_history(f"Modus: {mode_name}", "(Platzhalter)")
+            w.focus_mathfield()
         if self.drawer_open:
             self.toggle_drawer()
 
@@ -865,13 +1168,8 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self.theme, parent=self)
         dlg.exec()
 
-    # ---------- ESC: clear current input ----------
+    # ---------- Keyboard ----------
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            w = self.stack.currentWidget()
-            if isinstance(w, CalculatorPage):
-                w.clear_input()
-                return
         if event.matches(QKeySequence.AddTab):
             self.add_tab()
             return
@@ -880,8 +1178,6 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-
-    # your app icon (optional)
     app.setWindowIcon(QIcon("assets/app_icon2.png"))
 
     win = MainWindow()
