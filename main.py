@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolButton, QTabBar, QStackedWidget, QLabel,
     QGridLayout, QPushButton, QFrame, QSizePolicy,
-    QDialog, QDialogButtonBox, QColorDialog, QMenu
+    QDialog, QDialogButtonBox, QColorDialog, QMenu, QComboBox
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
@@ -155,7 +155,7 @@ HTML_HISTORY = r"""
 </head>
 <body>
   <div class="wrap" id="wrap">
-    <div class="hint" id="hint">History erscheint hier… (drücke =)</div>
+    <div class="hint" id="hint">History...</div>
     <div id="list"></div>
   </div>
 
@@ -241,13 +241,28 @@ class Theme:
     text: str = "#d7dde7"
     text_strong: str = "#ffffff"
 
+@dataclass
+class AppSettings:
+    number_format: str = "Normal"  # "Normal", "SCI", "ENG"
+
+
 
 class SettingsDialog(QDialog):
-    def __init__(self, theme: Theme, parent=None):
+    def __init__(self, theme: Theme, settings: AppSettings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Einstellungen")
         self.setModal(True)
         self.theme = theme
+
+        self.settings = settings
+
+        # aktuellen Wert setzen
+        idx = self.cmb_format.findText(self.settings.number_format)
+        if idx >= 0:
+            self.cmb_format.setCurrentIndex(idx)
+
+        self.cmb_format.currentTextChanged.connect(self.on_format_changed)
+
 
         root = QVBoxLayout(self)
         root.setContentsMargins(15, 15,  15, 15)
@@ -261,6 +276,13 @@ class SettingsDialog(QDialog):
         row.addWidget(self.btn_bg)
         row.addWidget(self.btn_fg)
         root.addLayout(row)
+
+        root.addWidget(QLabel("Zahlenformat:"))
+
+        self.cmb_format = QComboBox()
+        self.cmb_format.addItems(["Normal", "SCI", "ENG"])
+        root.addWidget(self.cmb_format)
+
 
         self.btn_bg.clicked.connect(self.pick_bg)
         self.btn_fg.clicked.connect(self.pick_fg)
@@ -284,6 +306,11 @@ class SettingsDialog(QDialog):
     def _notify(self):
         if isinstance(self.parent(), MainWindow):
             self.parent().apply_theme()
+
+    def on_format_changed(self, text: str):
+        self.settings.number_format = text
+        if isinstance(self.parent(), MainWindow):
+            self.parent().apply_settings()
 
 
 class DrawerMenu(QFrame):
@@ -477,6 +504,45 @@ def safe_eval(expr: str, ans_value):
         "Ans": ans_value if ans_value is not None else 0,
     }
     return eval(expr, env, {})
+
+def format_number(value, mode: str) -> str:
+    # Fehlertexte etc. einfach durchreichen
+    if isinstance(value, str):
+        return value
+
+    # ints sauber als int ausgeben
+    if isinstance(value, (int,)) and not isinstance(value, bool):
+        return str(value)
+
+    # floats
+    try:
+        x = float(value)
+    except Exception:
+        return str(value)
+
+    if mode == "SCI":
+        # wissenschaftlich: Mantisse * 10^exponent
+        return f"{x:.10e}"
+
+    if mode == "ENG":
+        # Engineering: Exponent Vielfaches von 3
+        if x == 0.0:
+            return "0"
+        sign = -1.0 if x < 0 else 1.0
+        ax = abs(x)
+
+        exp = int(math.floor(math.log10(ax)))
+        eng_exp = exp - (exp % 3)
+        mant = sign * (ax / (10 ** eng_exp))
+
+        # Mantisse hübsch kürzen
+        mant_str = f"{mant:.10f}".rstrip("0").rstrip(".")
+        return f"{mant_str}e{eng_exp}"
+
+    # Normal
+    # (hier könntest du optional noch runden/trimmen)
+    return f"{x:.12g}"
+
 
 
 # ---------------- Calculator Page (Input + History + Buttons) ----------------
