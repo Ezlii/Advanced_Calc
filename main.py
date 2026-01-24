@@ -241,9 +241,12 @@ class Theme:
     text: str = "#d7dde7"
     text_strong: str = "#ffffff"
 
+
 @dataclass
 class AppSettings:
-    number_format: str = "Normal"  # "Normal", "SCI", "ENG"
+    number_format: str = "Normal"   # "Normal", "SCI", "ENG"
+    angle_unit: str = "RAD"         # "RAD" oder "DEG"
+
 
 
 
@@ -252,20 +255,12 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Einstellungen")
         self.setModal(True)
-        self.theme = theme
 
+        self.theme = theme
         self.settings = settings
 
-        # aktuellen Wert setzen
-        idx = self.cmb_format.findText(self.settings.number_format)
-        if idx >= 0:
-            self.cmb_format.setCurrentIndex(idx)
-
-        self.cmb_format.currentTextChanged.connect(self.on_format_changed)
-
-
         root = QVBoxLayout(self)
-        root.setContentsMargins(15, 15,  15, 15)
+        root.setContentsMargins(15, 15, 15, 15)
         root.setSpacing(10)
 
         root.addWidget(QLabel("Farben anpassen:"))
@@ -279,10 +274,31 @@ class SettingsDialog(QDialog):
 
         root.addWidget(QLabel("Zahlenformat:"))
 
+        # WICHTIG: erst erstellen...
         self.cmb_format = QComboBox()
         self.cmb_format.addItems(["Normal", "SCI", "ENG"])
         root.addWidget(self.cmb_format)
 
+        root.addWidget(QLabel("Winkelmodus (sin/cos/tan):"))
+
+        self.cmb_angle = QComboBox()
+        self.cmb_angle.addItems(["RAD", "DEG"])
+        root.addWidget(self.cmb_angle)
+
+        # aktuellen Wert setzen
+        idx2 = self.cmb_angle.findText(self.settings.angle_unit)
+        if idx2 >= 0:
+            self.cmb_angle.setCurrentIndex(idx2)
+
+        self.cmb_angle.currentTextChanged.connect(self.on_angle_changed)
+
+
+        # ...dann aktuellen Wert setzen
+        idx = self.cmb_format.findText(self.settings.number_format)
+        if idx >= 0:
+            self.cmb_format.setCurrentIndex(idx)
+
+        self.cmb_format.currentTextChanged.connect(self.on_format_changed)
 
         self.btn_bg.clicked.connect(self.pick_bg)
         self.btn_fg.clicked.connect(self.pick_fg)
@@ -290,6 +306,7 @@ class SettingsDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
 
     def pick_bg(self):
         col = QColorDialog.getColor(QColor(self.theme.window_bg), self, "Fenster-Hintergrund wählen")
@@ -311,6 +328,12 @@ class SettingsDialog(QDialog):
         self.settings.number_format = text
         if isinstance(self.parent(), MainWindow):
             self.parent().apply_settings()
+
+    def on_angle_changed(self, text: str):
+        self.settings.angle_unit = text
+        if isinstance(self.parent(), MainWindow):
+            self.parent().apply_settings()
+
 
 
 class DrawerMenu(QFrame):
@@ -362,6 +385,11 @@ def latex_to_python(expr: str) -> str:
     s = s.replace(r"\sin", "sin")
     s = s.replace(r"\cos", "cos")
     s = s.replace(r"\tan", "tan")
+    # inverse trig: \sin^{-1}(x) -> asin(x) usw.
+    s = s.replace(r"sin^{-1}", "asin")
+    s = s.replace(r"cos^{-1}", "acos")
+    s = s.replace(r"tan^{-1}", "atan")
+
     s = s.replace(r"\ln", "ln")
 
     def extract_brace(text: str, brace_pos: int):
@@ -478,9 +506,24 @@ def latex_to_python(expr: str) -> str:
     return s
 
 
-def safe_eval(expr: str, ans_value):
+def safe_eval(expr: str, ans_value, angle_unit: str = "RAD"):
     def root(n, x):
         return x ** (1 / n)
+
+    def to_rad(x):
+        return math.radians(x) if angle_unit == "DEG" else x
+
+    def from_rad(x):
+        return math.degrees(x) if angle_unit == "DEG" else x
+
+    # trig angepasst
+    def sin_(x): return math.sin(to_rad(x))
+    def cos_(x): return math.cos(to_rad(x))
+    def tan_(x): return math.tan(to_rad(x))
+
+    def asin_(x): return from_rad(math.asin(x))
+    def acos_(x): return from_rad(math.acos(x))
+    def atan_(x): return from_rad(math.atan(x))
 
     env = {
         "__builtins__": {},
@@ -492,9 +535,15 @@ def safe_eval(expr: str, ans_value):
         "g": 9.80665,
         "sqrt": math.sqrt,
         "root": root,
-        "sin": math.sin,
-        "cos": math.cos,
-        "tan": math.tan,
+
+        # trig (RAD/DEG)
+        "sin": sin_,
+        "cos": cos_,
+        "tan": tan_,
+        "asin": asin_,
+        "acos": acos_,
+        "atan": atan_,
+
         "ln": math.log,
         "log10": math.log10,
         "log": math.log,  # log(x, base)
@@ -505,43 +554,43 @@ def safe_eval(expr: str, ans_value):
     }
     return eval(expr, env, {})
 
+
 def format_number(value, mode: str) -> str:
-    # Fehlertexte etc. einfach durchreichen
     if isinstance(value, str):
         return value
 
-    # ints sauber als int ausgeben
-    if isinstance(value, (int,)) and not isinstance(value, bool):
+    # bool ist auch int in Python -> aussortieren
+    if isinstance(value, bool):
         return str(value)
 
-    # floats
-    try:
+    # ints: nur Normal direkt, sonst als float formatieren
+    if isinstance(value, int):
+        if mode == "Normal":
+            return str(value)
         x = float(value)
-    except Exception:
-        return str(value)
+    else:
+        try:
+            x = float(value)
+        except Exception:
+            return str(value)
 
     if mode == "SCI":
-        # wissenschaftlich: Mantisse * 10^exponent
         return f"{x:.10e}"
 
     if mode == "ENG":
-        # Engineering: Exponent Vielfaches von 3
         if x == 0.0:
             return "0"
         sign = -1.0 if x < 0 else 1.0
         ax = abs(x)
-
         exp = int(math.floor(math.log10(ax)))
         eng_exp = exp - (exp % 3)
         mant = sign * (ax / (10 ** eng_exp))
-
-        # Mantisse hübsch kürzen
         mant_str = f"{mant:.10f}".rstrip("0").rstrip(".")
         return f"{mant_str}e{eng_exp}"
 
     # Normal
-    # (hier könntest du optional noch runden/trimmen)
     return f"{x:.12g}"
+
 
 
 
@@ -639,7 +688,7 @@ class CalculatorPage(QWidget):
 
         layout_labels = [
         ["2nd", "C",  "⌫",  "(",   ")",   "a/b"],   # <- a/b statt ÷
-        ["7",   "8",  "9",  "×",   "xʸ",  "x²"],
+        ["7",   "8",  "9",  "×",   "x²",  "xʸ"],
         ["4",   "5",  "6",  "−",   "√",   "x√y"],
         ["1",   "2",  "3",  "+",   "sin", "cos"],
         ["0",   ".",  "±",  "=",   "tan", "Ans"],
@@ -889,9 +938,18 @@ class CalculatorPage(QWidget):
             if not py_expr.strip():
                 return
             try:
-                res = safe_eval(py_expr, self.ans_value)
+                angle = "RAD"
+                mw = self.window()
+                if isinstance(mw, MainWindow):
+                    angle = mw.settings.angle_unit
+
+                res = safe_eval(py_expr, self.ans_value, angle_unit=angle)
                 self.ans_value = res
-                self.append_history(latex, str(res))
+                mode = "Normal"
+                mw = self.window()
+                if isinstance(mw, MainWindow):
+                    mode = mw.settings.number_format
+                self.append_history(latex, format_number(res, mode))
             except Exception as e:
                 self.append_history(latex, f"Fehler: {e}")
             finally:
@@ -905,6 +963,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.theme = Theme()
+        self.settings = AppSettings()
         self.close_icon = make_gray_close_icon(12)
 
         self.setWindowTitle(" ")
@@ -1171,7 +1230,7 @@ class MainWindow(QMainWindow):
         btn.setAutoRaise(True)
         btn.setCursor(Qt.PointingHandCursor)
         btn.setToolTip("Tab schließen")
-        btn.setFixedSize(18, 18)
+        btn.setFixedSize(15, 15)
         btn.clicked.connect(self.close_tab_from_button)
         self.tabbar.setTabButton(tab_index, QTabBar.RightSide, btn)
 
@@ -1231,8 +1290,15 @@ class MainWindow(QMainWindow):
 
     # ---------- Settings ----------
     def open_settings(self):
-        dlg = SettingsDialog(self.theme, parent=self)
+        dlg = SettingsDialog(self.theme, self.settings, parent=self)
         dlg.exec()
+
+    def apply_settings(self):
+        # Wenn du später noch UI/Pages aktiv aktualisieren willst, kannst du hier iterieren.
+        # Für jetzt reicht es, dass es existiert (damit kein AttributeError kommt).
+        pass
+
+
 
     # ---------- Keyboard ----------
     def keyPressEvent(self, event):
