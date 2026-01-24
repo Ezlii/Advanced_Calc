@@ -1,3 +1,22 @@
+"""
+Ideen für Verbesserungen:
+komplexe Zahlen
+konstanten hinzufügen
+integral und ableitung
+kgv, ggv
+matrizenrechner
+einheitenumrechner
+handbuch machen zum erklären
+grafik plotten
+leiterplattendesign
+einstellungen:
+    font size
+
+"""
+
+
+
+
 # main.py
 import sys
 import math
@@ -215,19 +234,27 @@ HTML_HISTORY = r"""
 
 
 # ---------------- Helpers: Theme + icons ----------------
-def make_gray_close_icon(size: int = 12) -> QIcon:
+def make_white_close_icon(size: int = 12) -> QIcon:
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
+
     p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing, True)
-    pen = QPen(Qt.lightGray)
-    pen.setWidth(2)
+    # KEIN Antialiasing -> schärfer bei kleinen Icons
+    p.setRenderHint(QPainter.Antialiasing, False)
+
+    pen = QPen(QColor("#ffffff"))
+    pen.setWidth(1)  # 1px wirkt crisp
+    pen.setCapStyle(Qt.SquareCap)
     p.setPen(pen)
-    margin = 2
-    p.drawLine(margin, margin, size - margin, size - margin)
-    p.drawLine(size - margin, margin, margin, size - margin)
+
+    # Pixel-Align (0.5) für scharfe 1px Linien
+    m = 3
+    p.drawLine(m + 0.5, m + 0.5, size - m - 0.5, size - m - 0.5)
+    p.drawLine(size - m - 0.5, m + 0.5, m + 0.5, size - m - 0.5)
+
     p.end()
     return QIcon(pm)
+
 
 
 @dataclass
@@ -964,7 +991,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.theme = Theme()
         self.settings = AppSettings()
-        self.close_icon = make_gray_close_icon(12)
+        self.close_icon = make_white_close_icon(14)
+
 
         self.setWindowTitle(" ")
         self.resize(980, 720)
@@ -1177,7 +1205,7 @@ class MainWindow(QMainWindow):
             }}
 
             QPushButton {{
-                font-size: 14px;
+                font-size: 15px;
                 border-radius: 0px;
                 border: 1px solid #1a1f27;
                 background: #141922;
@@ -1230,7 +1258,7 @@ class MainWindow(QMainWindow):
         btn.setAutoRaise(True)
         btn.setCursor(Qt.PointingHandCursor)
         btn.setToolTip("Tab schließen")
-        btn.setFixedSize(15, 15)
+        btn.setFixedSize(16, 16)
         btn.clicked.connect(self.close_tab_from_button)
         self.tabbar.setTabButton(tab_index, QTabBar.RightSide, btn)
 
